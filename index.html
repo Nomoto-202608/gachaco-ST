@@ -58,7 +58,7 @@ ol.results li{display:grid;grid-template-columns:40px 1fr;gap:2px 12px;align-ite
 .mapwrap{border-radius:14px;overflow:hidden;background:var(--panel);border:1px solid var(--line);min-height:0}
 .mapwrap #map{width:100%;height:100%;background:#f7f8f5}
 /* 地図の淡さ:opacity を小さくするほど淡く、大きくするほど濃くなります(0〜1) */
-.leaflet-tile-pane{opacity:.7;filter:grayscale(35%) contrast(.9) brightness(1.04)}
+.leaflet-tile-pane{opacity:.92;filter:grayscale(10%) contrast(1.08)}
 .leaflet-container{font:inherit}
 .st-logo{width:28px;height:28px;border-radius:50%;background:#fff;border:1.5px solid #c9cec2;box-shadow:0 1px 4px rgba(0,0,0,.3);display:grid;place-items:center}
 .st-logo img{width:18px;height:18px;display:block}
@@ -79,6 +79,10 @@ li.clickable:hover{border-color:var(--brand)}
 </style>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pmtiles@3.2.1/dist/pmtiles.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@maplibre/maplibre-gl-leaflet@0.0.22/leaflet-maplibre-gl.js"></script>
 </head>
 <body>
 <main>
@@ -101,7 +105,7 @@ li.clickable:hover{border-color:var(--brand)}
     <ol id="results" class="results"></ol>
     <div id="origin" class="origin"></div>
 
-    <p class="note">距離は直線距離です。実際の道のりは「経路を見る」からGoogleマップでご確認ください。住所の位置検索と地図には国土地理院のサービスを利用しています。</p>
+    <p class="note">距離は直線距離です。実際の道のりは「経路を見る」からGoogleマップでご確認ください。住所の位置検索と地図には国土地理院のサービス(地図:国土地理院最適化ベクトルタイル)を利用しています。</p>
   </section>
 
   <div class="mapwrap">
@@ -386,16 +390,105 @@ const FALLBACK = [
 
 const $ = id => document.getElementById(id);
 
-/* ===== 地図(国土地理院の淡色地図) ===== */
-let map = null, stationLayer = null, resultLayer = null;
+/* ===== 地図 ===== */
+let map = null, stationLayer = null, resultLayer = null, tiles = null, glLayer = null;
+
+/* ===== 地図の土台(国土地理院 最適化ベクトルタイル) ===== */
+const GSI_STYLE_URL = "https://gsi-cyberjapan.github.io/optimal_bvmap/style/std.json";
+// 表示しない地名の分類コード(210:大字・町名、212:同 補助、220:字・丁目名)
+// 区名・市名・駅名などはそのまま表示されます
+const HIDE_ANNO_CODES = [210, 212, 220];
+function hideTownNames(style){
+  const keep = ["!", ["in", ["get", "vt_code"], ["literal", HIDE_ANNO_CODES]]];
+  style.layers.forEach(l => {
+    if (l["source-layer"] !== "Anno" || !l.filter) return;
+    const f = l.filter;
+    if (Array.isArray(f) && f[0] === "step"){
+      // ズームで切り替わる条件の、それぞれの分岐に「町名以外」を足す
+      for (let k = 2; k < f.length; k += 2) f[k] = ["all", f[k], keep];
+    } else {
+      l.filter = ["all", f, keep];
+    }
+  });
+  return style;
+}
+// 地図記号(学校・郵便局などのマーク、国道番号など)を外す
+const ICON_ONLY_LAYERS = ["注記シンボル付き重なり", "注記道路番号", "水部表記線point"];
+function removeMapSymbols(style){
+  style.layers = style.layers.filter(l => !ICON_ONLY_LAYERS.includes(l.id));
+  style.layers.forEach(l => {
+    if (l.type === "symbol" && l.layout && "icon-image" in l.layout){
+      // 名前の文字は残し、マークだけ消す
+      Object.keys(l.layout).filter(k => k.startsWith("icon-")).forEach(k => delete l.layout[k]);
+      if (l.paint) Object.keys(l.paint).filter(k => k.startsWith("icon-")).forEach(k => delete l.paint[k]);
+    }
+  });
+  return style;
+}
+// 「標準地図」の配色を、淡色地図のような落ち着いた色に寄せる
+//  sat: 色みの残し具合(0=グレー, 1=元の色)/ white: 白に近づける割合(0〜1)
+const WATER_LAYERS = ["WA", "RvrCL", "WL", "Cstline", "WStrL", "WStrA"];
+function paleTone(layer){
+  const src = layer["source-layer"];
+  if (WATER_LAYERS.includes(src)) return { sat: .55, white: .2 };
+  if (layer.type === "symbol") return { sat: .45, white: .35 }; // 地名などの文字
+  if (layer.type === "fill") return { sat: .12, white: .55 };
+  if (src === "RdCL") return { sat: .12, white: .25 };
+  if (src === "BldA" || src === "StrctArea") return { sat: .1, white: .5 };
+  if (src === "RailCL" || src === "RailTrCL") return { sat: .4, white: .5 }; // 鉄道:黒→明るめのグレー
+  return { sat: .3, white: .3 };
+}
+function toPaleColors(style){
+  const re = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)$/;
+  const adjust = (c, t) => {
+    const m = re.exec(c);
+    if (!m) return c;
+    let r = +m[1], g = +m[2], b = +m[3];
+    const a = m[4] == null ? 1 : +m[4];
+    const y = .299 * r + .587 * g + .114 * b;
+    [r, g, b] = [r, g, b].map(v => { v = y + (v - y) * t.sat; return Math.round(v + (255 - v) * t.white); });
+    return `rgba(${r},${g},${b},${a})`;
+  };
+  const walk = (v, t) => typeof v === "string" ? adjust(v, t) : Array.isArray(v) ? v.map(x => walk(x, t)) : v;
+  style.layers.forEach(l => {
+    if (!l.paint || l.type === "background") return;
+    const t = paleTone(l);
+    Object.keys(l.paint).forEach(k => {
+      if (/color/.test(k) && !/halo/.test(k)) l.paint[k] = walk(l.paint[k], t);
+    });
+  });
+  return style;
+}
+function addRasterBase(){
+  tiles = L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", {
+    maxZoom: 18, minZoom: 5,
+    attribution: '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener">国土地理院</a>'
+  }).addTo(map);
+}
+async function addBaseMap(){
+  try {
+    if (typeof maplibregl === "undefined" || typeof pmtiles === "undefined" || !L.maplibreGL) throw new Error("ベクトル地図のライブラリを読み込めませんでした");
+    const res = await fetch(GSI_STYLE_URL);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const style = toPaleColors(removeMapSymbols(hideTownNames(await res.json())));
+    maplibregl.addProtocol("pmtiles", new pmtiles.Protocol().tile);
+    glLayer = L.maplibreGL({
+      style,
+      preserveDrawingBuffer: true, // 印刷に地図を写すため
+      fadeDuration: 0,             // 地名をフェードさせず即表示(印刷で消えないように)
+      attribution: '<a href="https://github.com/gsi-cyberjapan/optimal_bvmap" target="_blank" rel="noopener">国土地理院最適化ベクトルタイル</a>'
+    }).addTo(map);
+  } catch (e) {
+    console.warn("ベクトル地図を使えないため、淡色地図で表示します:", e);
+    addRasterBase();
+  }
+}
+
 function esc(s){ return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
 function initMap(){
   if (typeof L === "undefined"){ $("map").textContent = "地図を読み込めませんでした。"; return; }
   map = L.map("map", { zoomControl: true }).setView([35.68, 139.76], 10);
-  L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", {
-    maxZoom: 18, minZoom: 5,
-    attribution: '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener">国土地理院</a>'
-  }).addTo(map);
+  addBaseMap();
   stationLayer = L.layerGroup().addTo(map);
   resultLayer = L.layerGroup().addTo(map);
 }
